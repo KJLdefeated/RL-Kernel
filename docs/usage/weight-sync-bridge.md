@@ -269,6 +269,12 @@ Run rollout and vLLM paths:
 
 ```bash
 python benchmarks/benchmark_weight_sync_bridge.py --smoke --mode rollout-update
+```
+
+Install the vLLM extra before running the vLLM benchmark modes:
+
+```bash
+pip install -e ".[vllm]"
 python benchmarks/benchmark_weight_sync_bridge.py --mode vllm-cuda-ipc-hot-update --model /path/to/model
 python benchmarks/benchmark_weight_sync_bridge.py --mode vllm-cuda-vmm-external-storage --model /path/to/model
 ```
