@@ -2,7 +2,9 @@
 // Copyright (c) 2026 RL-Kernel Contributors
 
 #include <torch/extension.h>
+#include <cuda_bf16.h>
 
+// Fused LogP Declarations
 torch::Tensor fused_logp_forward(torch::Tensor logits, torch::Tensor token_ids);
 
 #if defined(__CUDACC__) || defined(KERNEL_ALIGN_WITH_SM90)
@@ -10,45 +12,22 @@ torch::Tensor fused_logp_sm90_forward(torch::Tensor logits, torch::Tensor labels
 #endif
 
 #if defined(__CUDACC__) || defined(KERNEL_ALIGN_WITH_CUDA)
-torch::Tensor fused_logp_forward_out(
-    torch::Tensor logits,
-    torch::Tensor token_ids,
-    torch::Tensor output);
+torch::Tensor fused_logp_forward_out(torch::Tensor logits, torch::Tensor token_ids, torch::Tensor output);
 torch::Tensor fused_logp_forward_fp32(torch::Tensor logits, torch::Tensor token_ids);
-torch::Tensor fused_logp_forward_indexed_out(
-    torch::Tensor logits,
-    torch::Tensor token_ids,
-    torch::Tensor row_indices,
-    torch::Tensor output);
-torch::Tensor fused_logp_forward_indexed_fp32(
-    torch::Tensor logits,
-    torch::Tensor token_ids,
-    torch::Tensor row_indices);
-torch::Tensor fused_logp_forward_online_out(
-    torch::Tensor logits,
-    torch::Tensor token_ids,
-    torch::Tensor output);
+torch::Tensor fused_logp_forward_indexed_out(torch::Tensor logits, torch::Tensor token_ids, torch::Tensor row_indices, torch::Tensor output);
+torch::Tensor fused_logp_forward_indexed_fp32(torch::Tensor logits, torch::Tensor token_ids, torch::Tensor row_indices);
+torch::Tensor fused_logp_forward_online_out(torch::Tensor logits, torch::Tensor token_ids, torch::Tensor output);
 torch::Tensor fused_logp_forward_online_fp32(torch::Tensor logits, torch::Tensor token_ids);
-torch::Tensor fused_logp_forward_online_indexed_out(
-    torch::Tensor logits,
-    torch::Tensor token_ids,
-    torch::Tensor row_indices,
-    torch::Tensor output);
-torch::Tensor fused_logp_forward_online_indexed_fp32(
-    torch::Tensor logits,
-    torch::Tensor token_ids,
-    torch::Tensor row_indices);
-#endif
-
+torch::Tensor fused_logp_forward_online_indexed_out(torch::Tensor logits, torch::Tensor token_ids, torch::Tensor row_indices, torch::Tensor output);
+torch::Tensor fused_logp_forward_online_indexed_fp32(torch::Tensor logits, torch::Tensor token_ids, torch::Tensor row_indices);
 
 // Prefix-Shared Attention Declarations & Wrappers
-#if defined(__CUDACC__) || defined(KERNEL_ALIGN_WITH_CUDA)
 
 void prefix_shared_attention_forward(
-  const nv_bfloat16 *Q,  // [bs, G, len_q, DIM]
-  const nv_bfloat16 *K,  // [bs, len_kv, DIM]
-  const nv_bfloat16 *V,  // [bs, len_kv, DIM]
-  nv_bfloat16 *O,        // [bs, G, len_q, DIM]
+  const __nv_bfloat16 *Q,  // [bs, G, len_q, DIM]
+  const __nv_bfloat16 *K,  // [bs, len_kv, DIM]
+  const __nv_bfloat16 *V,  // [bs, len_kv, DIM]
+  __nv_bfloat16 *O,        // [bs, G, len_q, DIM]
   int bs,
   int G,
   int len_q,
@@ -77,10 +56,10 @@ at::Tensor prefix_shared_attention(
 
   at::Tensor O = at::empty_like(Q);
 
-  auto Q_ptr = reinterpret_cast<const nv_bfloat16 *>(Q.data_ptr());
-  auto K_ptr = reinterpret_cast<const nv_bfloat16 *>(K.data_ptr());
-  auto V_ptr = reinterpret_cast<const nv_bfloat16 *>(V.data_ptr());
-  auto O_ptr = reinterpret_cast<nv_bfloat16 *>(O.data_ptr());
+  auto Q_ptr = reinterpret_cast<const __nv_bfloat16 *>(Q.data_ptr());
+  auto K_ptr = reinterpret_cast<const __nv_bfloat16 *>(K.data_ptr());
+  auto V_ptr = reinterpret_cast<const __nv_bfloat16 *>(V.data_ptr());
+  auto O_ptr = reinterpret_cast<__nv_bfloat16 *>(O.data_ptr());
 
   prefix_shared_attention_forward(Q_ptr, K_ptr, V_ptr, O_ptr, bs, G, len_q, len_kv, dim);
 
@@ -88,6 +67,7 @@ at::Tensor prefix_shared_attention(
 }
 #endif
 
+// PyBind11 Module Registration
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "RL-Kernel High-Performance Operator Extension Library";
 
@@ -100,33 +80,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 #if defined(__CUDACC__) || defined(KERNEL_ALIGN_WITH_CUDA)
     m.def("fused_logp_forward_out", &fused_logp_forward_out, "Fused logp out");
     m.def("fused_logp_forward_fp32", &fused_logp_forward_fp32, "Fused logp fp32");
-    m.def(
-        "fused_logp_forward_indexed_out",
-        &fused_logp_forward_indexed_out,
-        "Fused logp indexed out");
-    m.def(
-        "fused_logp_forward_indexed_fp32",
-        &fused_logp_forward_indexed_fp32,
-        "Fused logp indexed fp32");
-    m.def(
-        "fused_logp_forward_online_out",
-        &fused_logp_forward_online_out,
-        "Fused logp online out");
-    m.def(
-        "fused_logp_forward_online_fp32",
-        &fused_logp_forward_online_fp32,
-        "Fused logp online fp32");
-    m.def(
-        "fused_logp_forward_online_indexed_out",
-        &fused_logp_forward_online_indexed_out,
-        "Fused logp online indexed out");
-    m.def(
-        "fused_logp_forward_online_indexed_fp32",
-        &fused_logp_forward_online_indexed_fp32,
-        "Fused logp online indexed fp32");
-    m.def(
-        "prefix_shared_attention", 
-        &prefix_shared_attention, 
-        "Prefix-Shared Fused Attention for GRPO");
+    m.def("fused_logp_forward_indexed_out", &fused_logp_forward_indexed_out, "Fused logp indexed out");
+    m.def("fused_logp_forward_indexed_fp32", &fused_logp_forward_indexed_fp32, "Fused logp indexed fp32");
+    m.def("fused_logp_forward_online_out", &fused_logp_forward_online_out, "Fused logp online out");
+    m.def("fused_logp_forward_online_fp32", &fused_logp_forward_online_fp32, "Fused logp online fp32");
+    m.def("fused_logp_forward_online_indexed_out", &fused_logp_forward_online_indexed_out, "Fused logp online indexed out");
+    m.def("fused_logp_forward_online_indexed_fp32", &fused_logp_forward_online_indexed_fp32, "Fused logp online indexed fp32");
+        
+    // registry Prefix-Shared Attention
+    m.def("prefix_shared_attention", &prefix_shared_attention, "Prefix-Shared Fused Attention for GRPO");
 #endif
 }

@@ -1,15 +1,86 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 RL-Kernel Contributors
 
-#include "../utils/common.h"
 #include <cuda_bf16.h>
 #include <cstdint>
 #include <float.h>
 #include <iostream>
 
+using nv_bfloat16 = __nv_bfloat16;
+using nv_bfloat162 = __nv_bfloat162;
+
+#define CUDA_CHECK(x)                                                                 \
+  {                                                                                   \
+    auto error = x;                                                                   \
+    if (error != cudaSuccess) {                                                       \
+      std::cerr << "CUDA error - L" << __LINE__ << ": " << cudaGetErrorString(error) << std::endl; \
+      exit(1);                                                                        \
+    }                                                                                 \
+  }
+
+inline constexpr int WARP_SIZE = 32;
+
+__device__ __host__ constexpr int cdiv(int a, int b) { return (a + b - 1) / b; }
+
+// NOTE: stride in bytes
+template <int STRIDE>
+__device__ inline uint32_t swizzle(uint32_t index) {
+  if constexpr (STRIDE == 16) return index;
+  uint32_t row_idx = (index / STRIDE) % 8;
+  uint32_t bits_to_xor = row_idx / max(64 / STRIDE, 1);
+  return index ^ (bits_to_xor << 4);
+}
+
+template <int HEIGHT, int WIDTH, int TB_SIZE>
+__device__ inline void global_to_shared_swizzle(uint32_t dst, const nv_bfloat16 *src, int src_stride, int tid) {
+  constexpr int num_elems = 16 / sizeof(nv_bfloat16);
+  constexpr int num_iters = HEIGHT * WIDTH / (TB_SIZE * num_elems);
+
+  for (int iter = 0; iter < num_iters; iter++) {
+    const int idx = (iter * TB_SIZE + tid) * num_elems;
+    const int row = idx / WIDTH;
+    const int col = idx % WIDTH;
+
+    const uint32_t dst_addr = swizzle<WIDTH * sizeof(nv_bfloat16)>(dst + (row * WIDTH + col) * sizeof(nv_bfloat16));
+    const nv_bfloat16 *src_addr = src + (row * src_stride + col);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(dst_addr), "l"(src_addr));
+  }
+}
+
+__device__ inline void ldmatrix_x4(uint32_t regs[4], uint32_t addr) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
+              : "=r"(regs[0]), "=r"(regs[1]), "=r"(regs[2]), "=r"(regs[3])
+              : "r"(addr));
+}
+
+__device__ inline void ldmatrix_x4_trans(uint32_t regs[4], uint32_t addr) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];"
+              : "=r"(regs[0]), "=r"(regs[1]), "=r"(regs[2]), "=r"(regs[3])
+              : "r"(addr));
+}
+
+__device__ inline void mma_m16n8k16(uint32_t A[4], uint32_t B[2], float D[4]) {
+  asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+              "{%0, %1, %2, %3}, "
+              "{%4, %5, %6, %7}, "
+              "{%8, %9}, "
+              "{%10, %11, %12, %13};"
+              : "=f"(D[0]), "=f"(D[1]), "=f"(D[2]), "=f"(D[3])
+              : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
+                "r"(B[0]), "r"(B[1]),
+                "f"(D[0]), "f"(D[1]), "f"(D[2]), "f"(D[3]));
+}
+
+template <typename T, typename... Args>
+void launch_kernel(T *kernel, dim3 grid, int block_size, int smem_size, Args... args) {
+  if (smem_size > 48000) {
+    CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+  }
+  kernel<<<grid, block_size, smem_size>>>(args...);
+  CUDA_CHECK(cudaGetLastError());
+}
+
 // Prefix-Shared Fused Attention Kernel
-// Designed specifically for GRPO scenarios: 
-// [bs, G, len_q] share the same [bs, len_kv] prefix.
 
 template<int BLOCK_Q, int BLOCK_KV, int DIM, int NUM_WARPS>
 __launch_bounds__(NUM_WARPS * WARP_SIZE)
@@ -19,13 +90,9 @@ void prefix_shared_attention_kernel(
   const nv_bfloat16 *K,  // [bs, len_kv, DIM]
   const nv_bfloat16 *V,  // [bs, len_kv, DIM]
   nv_bfloat16 *O,        // [bs, G, len_q, DIM]
-  int bs,
-  int G,
-  int len_q,
-  int len_kv) {
+  int bs, int G, int len_q, int len_kv) {
 
   constexpr int TB_SIZE = NUM_WARPS * WARP_SIZE;
-
   const int tid = threadIdx.x;
   const int warp_id = tid / WARP_SIZE;
   const int lane_id = tid % WARP_SIZE;
@@ -42,10 +109,9 @@ void prefix_shared_attention_kernel(
 
   extern __shared__ nv_bfloat16 smem[];
   const uint32_t Q_smem = __cvta_generic_to_shared(smem);
-  const uint32_t K_smem = Q_smem;
+  const uint32_t K_smem = Q_smem; 
   const uint32_t V_smem = K_smem + 2 * BLOCK_KV * DIM * sizeof(nv_bfloat16);
 
-  // Split BLOCK_Q across all warps and replicate K and V across all warps.
   constexpr int WARP_Q = BLOCK_Q / NUM_WARPS;
   constexpr int MMA_M = 16;
   constexpr int MMA_N = 8;
@@ -56,7 +122,6 @@ void prefix_shared_attention_kernel(
   uint32_t P_rmem[WARP_Q / MMA_M][BLOCK_KV / MMA_K][4];
   uint32_t V_rmem[BLOCK_KV / MMA_K][DIM / MMA_N][2];
   
-  // Accumulator and Softmax State
   float O_rmem[WARP_Q / MMA_M][DIM / MMA_N][4] = {};
   const float softmax_scale = rsqrtf(static_cast<float>(DIM));
   float rowmax[WARP_Q / MMA_M][2];
@@ -67,7 +132,6 @@ void prefix_shared_attention_kernel(
     rowmax[mma_id_q][1] = -FLT_MAX;
   }
 
-  // Pre-compute ldmatrix swizzle address
   uint32_t Q_smem_thread, K_smem_thread, V_smem_thread;
   {
     const int row_off = warp_id * WARP_Q + (lane_id % 16);
@@ -124,13 +188,12 @@ void prefix_shared_attention_kernel(
   for (int kv_id = 0; kv_id < num_kv_iter; kv_id++) {
     float S_rmem[WARP_Q / MMA_M][BLOCK_KV / MMA_N][4] = {};
 
-    __syncthreads();
+    __syncthreads(); 
     load_V(kv_id);
 
     asm volatile("cp.async.wait_group 1;");
     __syncthreads();
     
-    // K: Shared -> Registers
     for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++)
       for (int mma_id_d = 0; mma_id_d < DIM / MMA_K; mma_id_d += 2) {
         uint32_t addr = K_smem_thread + (kv_id % 2) * (BLOCK_KV * DIM * sizeof(nv_bfloat16));
@@ -139,7 +202,6 @@ void prefix_shared_attention_kernel(
         ldmatrix_x4(K_rmem[mma_id_kv][mma_id_d], addr);
       }
 
-    // MMA S = Q @ K.T
     for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++)
       for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++)
         for (int mma_id_d = 0; mma_id_d < DIM / MMA_K; mma_id_d++)
@@ -147,7 +209,6 @@ void prefix_shared_attention_kernel(
 
     load_K(kv_id + 1);
 
-    // Online Softmax calculation
     for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++) {
       for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++)
         for (int reg_id = 0; reg_id < 4; reg_id++)
@@ -202,7 +263,6 @@ void prefix_shared_attention_kernel(
           this_rowsumexp[1] += regs[2] + regs[3];
         }
 
-        // Packed into the P register in preparation for P@V
         nv_bfloat162 *this_P_rmem = reinterpret_cast<nv_bfloat162 *>(P_rmem[mma_id_q][mma_id_kv / 2]);
         this_P_rmem[(mma_id_kv % 2) * 2]     = __float22bfloat162_rn({regs[0], regs[1]});
         this_P_rmem[(mma_id_kv % 2) * 2 + 1] = __float22bfloat162_rn({regs[2], regs[3]});
@@ -220,7 +280,6 @@ void prefix_shared_attention_kernel(
     asm volatile("cp.async.wait_group 1;");
     __syncthreads();
 
-    // V: Shared -> Registers
     for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_K; mma_id_kv++)
       for (int mma_id_d = 0; mma_id_d < DIM / MMA_N; mma_id_d += 2) {
         uint32_t addr = V_smem_thread;
@@ -229,7 +288,6 @@ void prefix_shared_attention_kernel(
         ldmatrix_x4_trans(V_rmem[mma_id_kv][mma_id_d], addr);
       }
 
-    // MMA O += P @ V
     for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++)
       for (int mma_id_d = 0; mma_id_d < DIM / MMA_N; mma_id_d++)
         for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_K; mma_id_kv++)
@@ -252,28 +310,18 @@ void prefix_shared_attention_kernel(
     }
 }
 
+// Host API
 void prefix_shared_attention_forward(
-  const nv_bfloat16 *Q,  // [bs, G, len_q, DIM]
-  const nv_bfloat16 *K,  // [bs, len_kv, DIM]
-  const nv_bfloat16 *V,  // [bs, len_kv, DIM]
-  nv_bfloat16 *O,        // [bs, G, len_q, DIM]
-  int bs,
-  int G,
-  int len_q,
-  int len_kv,
-  int dim) {
-
-  if (dim != 128) {
-    std::cerr << "RL-Kernel Prefix-Shared Attention currently only supports head_dim=128." << std::endl;
-    exit(1);
-  }
+  const __nv_bfloat16 *Q, const __nv_bfloat16 *K, const __nv_bfloat16 *V, __nv_bfloat16 *O, 
+  int bs, int G, int len_q, int len_kv, int dim) {
+  
+  if (dim != 128) { std::cerr << "Only dim=128 supported." << std::endl; exit(1); }
 
   const int BLOCK_Q = 64;
   const int BLOCK_KV = 64;
   const int DIM = 128;
   const int NUM_WARPS = 4;
 
-  // Using 3D Grid Mapping
   dim3 grid(cdiv(len_q, BLOCK_Q), G, bs);
   const int TB_SIZE = NUM_WARPS * WARP_SIZE;
   const int smem_size = max(BLOCK_Q, BLOCK_KV * 3) * DIM * sizeof(nv_bfloat16);

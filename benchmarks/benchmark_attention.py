@@ -1,61 +1,66 @@
 # File: benchmarks/benchmark_attention.py
 import torch
 import triton
-from rl_engine.kernels.ops.attention import prefix_shared_sdpa
+import pandas as pd
+from tabulate import tabulate
+from rl_engine.kernels.ops.cuda.attention.prefix_shared_attn import PrefixSharedAttentionOp
 
 def run_benchmark():
     bs = 1
     G = 64
     len_q = 512
-    len_kv = 4096
     dim = 128
+    
+    len_kvs = [1024, 2048, 4096, 8192, 16384] 
 
-    print(f"Benchmarking GRPO Prefix-Shared Attention")
-    print(f"Shape: bs={bs}, G={G}, len_q={len_q}, len_kv={len_kv}, dim={dim}")
+    print(f"\n Benchmarking GRPO Prefix-Shared Attention")
+    print(f"Fixed Shapes: Batch={bs}, Group(Response)={G}, Query_Len={len_q}, Head_Dim={dim}\n")
 
-    q = torch.randn(bs, G, len_q, dim, dtype=torch.bfloat16, device="cuda")
-    k = torch.randn(bs, len_kv, dim, dtype=torch.bfloat16, device="cuda")
-    v = torch.randn(bs, len_kv, dim, dtype=torch.bfloat16, device="cuda")
+    prefix_shared_sdpa = PrefixSharedAttentionOp()
+    results = []
 
-    out_ref = prefix_shared_sdpa(q, k, v)
-    out_custom = prefix_shared_sdpa(q, k, v)
-    # torch.testing.assert_close(out_custom, out_ref, atol=1e-2, rtol=1e-2)
-
-    @triton.testing.perf_report(
-        triton.testing.Benchmark(
-            x_names=['len_kv'],
-            x_vals=[1024, 2048, 4096, 8192],
-            line_arg='provider',
-            line_vals=['torch_native', 'rl_kernel_shared'],
-            line_names=['PyTorch Native SDPA', 'RL-Kernel Prefix-Shared'],
-            styles=[('blue', '-'), ('green', '-')],
-            ylabel='Latency (ms)',
-            plot_name='prefix-shared-attention-performance',
-            args={'bs': bs, 'G': G, 'len_q': len_q, 'dim': dim}
-        )
-    )
-    def benchmark(bs, G, len_q, len_kv, dim, provider):
+    for len_kv in len_kvs:
         q = torch.randn(bs, G, len_q, dim, dtype=torch.bfloat16, device="cuda")
         k = torch.randn(bs, len_kv, dim, dtype=torch.bfloat16, device="cuda")
         v = torch.randn(bs, len_kv, dim, dtype=torch.bfloat16, device="cuda")
 
-        quantiles = [0.5, 0.2, 0.8]
-        if provider == 'torch_native':
-            k_exp = k.unsqueeze(1).expand(-1, G, -1, -1).reshape(bs * G, 1, len_kv, dim).contiguous()
-            v_exp = v.unsqueeze(1).expand(-1, G, -1, -1).reshape(bs * G, 1, len_kv, dim).contiguous()
-            q_res = q.view(bs * G, 1, len_q, dim)
-            ms, min_ms, max_ms = triton.testing.do_bench(
-                lambda: torch.nn.functional.scaled_dot_product_attention(q_res, k_exp, v_exp), 
-                quantiles=quantiles
-            )
-        else:
-            ms, min_ms, max_ms = triton.testing.do_bench(
-                lambda: prefix_shared_sdpa(q, k, v), 
-                quantiles=quantiles
-            )
-        return ms, min_ms, max_ms
+        k_exp = k.unsqueeze(1).expand(-1, G, -1, -1).reshape(bs * G, 1, len_kv, dim).contiguous()
+        v_exp = v.unsqueeze(1).expand(-1, G, -1, -1).reshape(bs * G, 1, len_kv, dim).contiguous()
+        q_res = q.view(bs * G, 1, len_q, dim)
 
-    benchmark.run(print_data=True)
+        for _ in range(5):
+            _ = torch.nn.functional.scaled_dot_product_attention(q_res, k_exp, v_exp)
+            _ = prefix_shared_sdpa(q, k, v)
+
+        native_ms = triton.testing.do_bench(
+            lambda: torch.nn.functional.scaled_dot_product_attention(q_res, k_exp, v_exp),
+            return_mode="median"
+        )
+
+        custom_ms = triton.testing.do_bench(
+            lambda: prefix_shared_sdpa(q, k, v),
+            return_mode="median"
+        )
+
+        speedup = native_ms / custom_ms
+        reduction = (native_ms - custom_ms) / native_ms * 100
+        
+        flops = 4 * bs * G * len_q * len_kv * dim
+        native_tflops = (flops / 1e12) / (native_ms / 1000)
+        custom_tflops = (flops / 1e12) / (custom_ms / 1000)
+
+        results.append({
+            "Prompt Len": len_kv,
+            "Native (ms)": f"{native_ms:.3f}",
+            "RL-Kernel (ms)": f"{custom_ms:.3f}",
+            "Native TFLOPS": f"{native_tflops:.1f}",
+            "RL-Kernel TFLOPS": f"{custom_tflops:.1f}",
+            "Speedup": f"{speedup:.2f}x",
+            "Time Saved": f"{reduction:.1f}%"
+        })
+
+    df = pd.DataFrame(results)
+    print(tabulate(df, headers="keys", tablefmt="pretty", stralign="center", showindex=False))
 
 if __name__ == "__main__":
     run_benchmark()
