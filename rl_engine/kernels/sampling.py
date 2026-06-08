@@ -50,9 +50,8 @@ class SamplerBackend(nn.Module):
         if self.backend == constants.BackendLib.FLASHINFER.value:
             from flashinfer.sampling import top_k_renorm_probs, top_p_sampling_from_probs
 
+            # Temperature is already applied above; do not re-divide here.
             logits = logits.float().contiguous()
-            if temperature != 1.0:
-                logits.div_(temperature)
 
             probs = torch.softmax(logits, dim=-1)
 
